@@ -1,0 +1,15 @@
+{
+  "update_servers": [
+    {
+      "owner": "joomengine",
+      "repo": "pkg-component-builder",
+      "branch": "main",
+      "path": "component_updates.xml"
+    },
+    {
+      "owner": "joomengine",
+      "repo": "another-repo",
+      "path": "admin/component_updates.xml"
+    }
+  ]
+}

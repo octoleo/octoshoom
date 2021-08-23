@@ -1,0 +1,337 @@
+#!/bin/bash
+#
+# OctoShoom — Joomla Update Server SHA512 Hash Injector
+# v1.0.1 | Adds <sha512> tags to Joomla update XML files, commits & pushes.
+#
+
+# Program Metadata
+PROGRAM_NAME="OctoShoom"
+PROGRAM_CODE="octoshoom"
+PROGRAM_VERSION="1.0.1"
+PROGRAM_V="1.0"
+PROGRAM_URL="https://git.vdm.dev/octoleo/${PROGRAM_CODE}"
+
+# PREP WORK
+command -v git >/dev/null 2>&1 || {
+	echo >&2 "[error] We require git for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+	exit 1
+}
+command -v curl >/dev/null 2>&1 || {
+	echo >&2 "[error] We require curl for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+	exit 1
+}
+command -v sha512sum >/dev/null 2>&1 || {
+	echo >&2 "[error] We require sha512sum for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+	exit 1
+}
+command -v awk >/dev/null 2>&1 || {
+	echo >&2 "[error] We require awk for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+	exit 1
+}
+command -v xmlstarlet >/dev/null 2>&1 || {
+	echo >&2 "[error] We require xmlstarlet for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+	exit 1
+}
+
+# GLOBAL CACHE for processed URLs
+declare -A URL_HASH_CACHE
+
+# MAIN FUNCTION ˘Ô≈ôﺣ
+function main() {
+	[ -f "$OCTOSHOOM_CONF_FILE" ] && getProjectEnvironment || {
+		echo >&2 "[error] Missing config file $OCTOSHOOM_CONF_FILE. Aborting."
+		exit 1
+	}
+
+	processUpdateServers || {
+		echo >&2 "[error] One or more repositories failed to update. Aborting."
+		exit 1
+	}
+
+	_echo "[Success] All repositories updated with SHA512 hashes!"
+
+	# Clear global cache (clean state)
+	unset URL_HASH_CACHE
+}
+
+# QUIET MODE
+QUIET="${QUIET:-0}"
+_echo() { (("$QUIET" == 0)) && echo "$1"; }
+
+# LOAD ENVIRONMENT
+function getProjectEnvironment() {
+	VDM_CONFIG_DATA=$(cat "$OCTOSHOOM_CONF_FILE")
+	if [[ "${VDM_CONFIG_DATA}" =~ '"update_servers"' ]]; then
+		_echo "[info] Loading configuration for $PROGRAM_NAME..."
+		export VDM_CONFIG_DATA
+		return 0
+	else
+		return 17
+	fi
+}
+
+# GIT USER CONFIG
+function setUserDetails() {
+	# Configure Git commit identity and signing.
+	[ -n "${GIT_AUTHOR_NAME+x}" ] && git config user.name "${GIT_AUTHOR_NAME}" && _echo "[info] Git author name set: ${GIT_AUTHOR_NAME}"
+	[ -n "${GIT_AUTHOR_EMAIL+x}" ] && git config user.email "${GIT_AUTHOR_EMAIL}" && _echo "[info] Git author email set: ${GIT_AUTHOR_EMAIL}"
+	[ -n "${GIT_SIGNING_KEY+x}" ] && git config user.signingkey "${GIT_SIGNING_KEY}" && _echo "[info] Git signing key set."
+	[ -n "${GIT_GPG_SIGN+x}" ] && git config commit.gpgsign "${GIT_GPG_SIGN}" && _echo "[info] Git commit signing: ${GIT_GPG_SIGN}"
+}
+
+# PROCESS UPDATE SERVERS
+function processUpdateServers() {
+	# Group update servers by owner/repo
+	local grouped_json
+	grouped_json=$(echo "${VDM_CONFIG_DATA}" | jq -c '
+	  .update_servers
+	  | group_by({owner, repo})
+	  | map({
+	      owner: .[0].owner,
+	      repo: .[0].repo,
+	      branches: map({branch: (.branch // "master"), path: .path})
+	    })')
+
+	local repo_count
+	repo_count=$(echo "$grouped_json" | jq 'length')
+
+	for ((r=0; r<repo_count; r++)); do
+		local owner repo branches
+		owner=$(echo "$grouped_json" | jq -r ".[$r].owner")
+		repo=$(echo "$grouped_json" | jq -r ".[$r].repo")
+		branches=$(echo "$grouped_json" | jq -c ".[$r].branches")
+
+		processSingleRepository "$owner" "$repo" "$branches" || return 11
+	done
+	return 0
+}
+
+# PROCESS SINGLE REPOSITORY
+function processSingleRepository() {
+	# @param $1 owner
+	# @param $2 repo
+	# @param $3 branches_json (array of {branch, path})
+	local owner="$1"
+	local repo="$2"
+	local branches_json="$3"
+	local tmp_repo_dir
+	tmp_repo_dir=$(mktemp -d)
+	trap 'rm -rf "$tmp_repo_dir"' EXIT
+
+	_echo "[info] Cloning ${owner}/${repo} (bare, shallow)..."
+	git clone --no-checkout --filter=blob:none --depth=1 -q "git@${GIT_URL}:${owner}/${repo}.git" "$tmp_repo_dir/$repo" || return 12
+	cd "$tmp_repo_dir/$repo" || return 13
+
+	local branch_count
+	branch_count=$(echo "$branches_json" | jq 'length')
+
+	for ((b=0; b<branch_count; b++)); do
+		local branch path
+		branch=$(echo "$branches_json" | jq -r ".[$b].branch // \"master\"")
+		path=$(echo "$branches_json" | jq -r ".[$b].path")
+
+		_echo "[info] Fetching branch: $branch"
+		if ! git fetch --depth=1 origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1; then
+			echo >&2 "[error] Branch $branch not found on remote ${owner}/${repo}, skipping..."
+			continue
+		fi
+
+		_echo "[info] Resetting working tree to branch: $branch"
+		git checkout --detach >/dev/null 2>&1
+		git reset --hard "origin/$branch" >/dev/null 2>&1 || {
+			echo >&2 "[error] Could not reset to branch $branch, skipping..."
+			continue
+		}
+		git switch -C "$branch" >/dev/null 2>&1 || true
+
+		local xml_file="$tmp_repo_dir/$repo/$path"
+		if [ ! -f "$xml_file" ]; then
+			echo >&2 "[error] XML file $path not found in branch $branch"
+			continue
+		fi
+
+		updateXmlWithHashes "$xml_file"
+		formatXmlTabs "$xml_file"
+		commitAndPush "$tmp_repo_dir/$repo" "$branch" "$path"
+	done
+
+	rm -rf "$tmp_repo_dir"
+}
+
+# ADD TAB FORMAT TO XML FILE
+function formatXmlTabs() {
+	local xml="$1" tmp="${xml}.tmp"
+	# Pretty-print with 2 spaces, then convert *leading* spaces to tabs
+	# (unexpand without -a only converts leading blanks)
+	if xmlstarlet fo --omit-decl --indent-spaces 2 "$xml" | unexpand -t 2 > "$tmp"; then
+		mv "$tmp" "$xml"
+	else
+		rm -f "$tmp"; return 1
+	fi
+}
+
+# GET OR COMPUTE HASH (with caching)
+function getOrComputeHash() {
+	local url="$1"
+	local key
+
+	# Generate a consistent key
+	key=$(generateKey "$url")
+
+	# Check if we already cached this key
+	if [[ -v "URL_HASH_CACHE[$key]" ]]; then
+		# Value exists in cache
+		echo "[info] Already computed, reuse" >&2
+		echo "${URL_HASH_CACHE[$key]}"
+		return 0
+	fi
+
+	# Otherwise download and compute
+	local tmp_file sha
+	tmp_file=$(mktemp)
+
+	echo "[info] Downloading package: $(basename "$url")" >&2
+	if ! curl -sL "$url" -o "$tmp_file"; then
+		echo "[error] Failed to download $url" >&2
+		rm -f "$tmp_file"
+		return 1
+	fi
+
+	sha_output=$(sha512sum "$tmp_file")
+	sha=${sha_output%% *}
+	rm -f "$tmp_file"
+
+	# Store in cache
+	URL_HASH_CACHE["$key"]="$sha"
+
+	echo "$sha"
+	return 0
+}
+
+# Function to generate a stable key from a URL
+function generateKey() {
+    local url="$1"
+    # Output only the MD5 hash, no trailing newline or filename
+    printf '%s' "$url" | md5sum | awk '{print $1}'
+}
+
+# UPDATE XML WITH HASHES
+function updateXmlWithHashes() {
+	# Downloads each <downloadurl> file, calculates SHA512, updates <sha512>.
+	# @param $1 Path to XML file to modify
+	local xml="$1"
+	local urls sha update_xpath
+
+	# Collect all download URLs from the XML
+	mapfile -t urls < <(xmlstarlet sel -t -v "//downloadurl" -n "$xml")
+
+	for dl in "${urls[@]}"; do
+		sha=$(getOrComputeHash "$dl") || continue
+		_echo "[info] SHA512: $sha"
+
+		# XPath to <update> node containing this downloadurl
+		update_xpath="//downloadurl[text()='$dl']/ancestor::update"
+
+		# Remove any existing sha512 under that <update>
+		xmlstarlet ed -L -d "${update_xpath}/sha512" "$xml"
+
+		# Add new sha512 under that <update>
+		xmlstarlet ed -L -s "$update_xpath" -t elem -n "sha512" -v "$sha" "$xml"
+	done
+}
+
+# COMMIT & PUSH CHANGES
+function commitAndPush() {
+	# Commits the updated XML and pushes back to the remote repository.
+	# @param $1 Local repository path
+	# @param $2 Branch name
+	# @param $3 Path to XML file in repo
+	local repo_path="$1"
+	local branch="$2"
+	local file_path="$3"
+
+	cd "$repo_path" || return 21
+	setUserDetails
+
+	if git diff --quiet "$file_path"; then
+		_echo "[info] No changes detected in $file_path."
+		return 0
+	fi
+
+	git add "$file_path"
+	git commit -m "chore: add sha512 hashes via $PROGRAM_NAME" >/dev/null 2>&1 || return 22
+	_echo "[info] Pushing changes to ${branch}..."
+	git push origin "$branch" >/dev/null 2>&1 || return 23
+	_echo "[success] Pushed updates for ${repo_path##*/}"
+}
+
+# SHOW HELP ʕ•ᴥ•ʔ
+function show_help() {
+	cat <<EOF
+Usage: ${PROGRAM_CODE} [OPTIONS]
+
+Options:
+======================================================
+  --config=<file>       Path to JSON configuration file
+  -e | --env=<file>     Path to .env file with GIT variables
+  -q | --quiet          Silence all output
+  -h | --help           Display this help message
+
+Environment Variables:
+======================================================
+  GIT_AUTHOR_NAME       Git author name
+  GIT_AUTHOR_EMAIL      Git author email
+  GIT_GPG_SIGN          true|false
+  GIT_SIGNING_KEY       GPG key ID
+  GIT_URL               SSH domain (e.g. git.vdm.dev)
+
+Config Example (JSON):
+======================================================
+{
+  "update_servers": [
+    {
+      "owner": "joomengine",
+      "repo": "pkg-component-builder",
+      "branch": "main",
+      "path": "component_updates.xml"
+    },
+    {
+      "owner": "joomengine",
+      "repo": "another-repo",
+      "path": "admin/component_updates.xml"
+    }
+  ]
+}
+======================================================
+              ${PROGRAM_NAME} v${PROGRAM_VERSION}
+======================================================
+EOF
+}
+
+# DEFAULTS
+START_DATE=$(TZ=":ZULU" date +"%m/%d/%Y @ %R (UTC)")
+CREATION_DATE=$(TZ=":ZULU" date +"%B %Y")
+CREATION_YEAR=$(TZ=":ZULU" date +"%Y")
+
+# ARGUMENT PARSING
+while :; do
+	case $1 in
+	-h|--help) show_help; exit 0 ;;
+	-q|--quiet) QUIET=1 ;;
+	-e=*|--env=*) ENV_FILE=${1#*=}; source "$ENV_FILE" ;;
+	--config=*) OCTOSHOOM_CONF_FILE=${1#*=} ;;
+	--) shift; break ;;
+	*) break ;;
+	esac
+	shift
+done
+
+[ -f "${OCTOSHOOM_CONF_FILE}" ] || {
+	echo >&2 "[error] No config file found. Use --config=/path/to/config.json"
+	exit 1
+}
+
+# RUN MAIN ┬┴┬┴┤(･_├┬┴┬┴
+main
+exit 0
+
