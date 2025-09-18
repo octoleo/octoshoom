@@ -110,13 +110,13 @@ Your configuration file tells OctoShoom which repositories and XML files to proc
 {
   "update_servers": [
     {
-      "owner": "vdm-io",
+      "owner": "joomengine",
       "repo": "pkg-component-builder",
       "branch": "main",
       "path": "component_updates.xml"
     },
     {
-      "owner": "vdm-io",
+      "owner": "joomengine",
       "repo": "another-repo",
       "branch": "master",
       "path": "admin/component_updates.xml"
@@ -125,7 +125,7 @@ Your configuration file tells OctoShoom which repositories and XML files to proc
 }
 ```
 
-* **owner** – Git owner or namespace (e.g. `vdm-io`)
+* **owner** – Git owner or namespace (e.g. `joomengine`)
 * **repo** – Repository name (e.g. `pkg-component-builder`)
 * **branch** – Branch to clone (defaults to `master`)
 * **path** – Path to the XML file inside the repository root
