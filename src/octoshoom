@@ -163,7 +163,7 @@ function formatXmlTabs() {
 	local xml="$1" tmp="${xml}.tmp"
 	# Pretty-print with 2 spaces, then convert *leading* spaces to tabs
 	# (unexpand without -a only converts leading blanks)
-	if xmlstarlet fo --omit-decl --indent-spaces 2 "$xml" | unexpand -t 2 > "$tmp"; then
+	if xmlstarlet fo --indent-spaces 2 "$xml" | unexpand -t 2 > "$tmp"; then
 		mv "$tmp" "$xml"
 	else
 		rm -f "$tmp"; return 1
