@@ -1,0 +1,186 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: shellcheck src/octoshoom tests/test-octoshoom.sh
+
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xmlstarlet jq curl
+
+      - name: Run test suite
+        run: |
+          chmod +x src/octoshoom tests/test-octoshoom.sh
+          bash tests/test-octoshoom.sh ./src/octoshoom
+
+  action:
+    name: Action (end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare a local update server repository
+        id: prepare
+        run: |
+          set -euo pipefail
+          remotes="${RUNNER_TEMP}/remotes"
+          packages="${RUNNER_TEMP}/packages"
+          mkdir -p "${remotes}/joomengine" "${packages}"
+
+          # Fake extension package, served through file:// (no network needed)
+          head -c 4096 /dev/urandom > "${packages}/pkg-demo-1.0.0.zip"
+          expected_sha="$(sha512sum "${packages}/pkg-demo-1.0.0.zip" | awk '{print $1}')"
+
+          # Git identity for the runner (octoleo/git-user normally does this)
+          git config --global user.name "OctoShoom Test"
+          git config --global user.email "octoshoom@example.com"
+          git config --global init.defaultBranch main
+          git config --global uploadpack.allowFilter true
+          # Route git@localhost:owner/repo.git to the local bare repositories
+          git config --global url."file://${remotes}/".insteadOf "git@localhost:"
+
+          git init -q --bare "${remotes}/joomengine/pkg-demo.git"
+          src="$(mktemp -d)"
+          git -C "${src}" init -q -b main
+          cat > "${src}/component_updates.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <updates>
+            <update>
+              <name>Demo Package</name>
+              <element>pkg_demo</element>
+              <type>package</type>
+              <version>1.0.0</version>
+              <downloads>
+                <downloadurl type="full" format="zip">file://${packages}/pkg-demo-1.0.0.zip</downloadurl>
+              </downloads>
+              <targetplatform name="joomla" version="[45]\.[0-9]"/>
+            </update>
+          </updates>
+          EOF
+          git -C "${src}" add -A
+          git -C "${src}" commit -q -m "Initial update server"
+          git -C "${src}" push -q "file://${remotes}/joomengine/pkg-demo.git" main
+
+          cat > "${RUNNER_TEMP}/update_servers.json" <<EOF
+          {
+            "update_servers": [
+              { "owner": "joomengine", "repo": "pkg-demo", "branch": "main", "path": "component_updates.xml" }
+            ]
+          }
+          EOF
+
+          {
+            echo "config=${RUNNER_TEMP}/update_servers.json"
+            echo "remote=${remotes}/joomengine/pkg-demo.git"
+            echo "expected-sha=${expected_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Dry run (inline JSON configuration)
+        id: dry-run
+        uses: ./
+        with:
+          config-json: |
+            {
+              "update_servers": [
+                { "owner": "joomengine", "repo": "pkg-demo", "branch": "main", "path": "component_updates.xml" }
+              ]
+            }
+          git-url: localhost
+          dry-run: 'true'
+
+      - name: Verify the dry run pushed nothing
+        env:
+          CHANGED: ${{ steps.dry-run.outputs.changed }}
+          DRY_RUN: ${{ steps.dry-run.outputs.dry-run }}
+          UPDATED: ${{ steps.dry-run.outputs.updated }}
+          REMOTE: ${{ steps.prepare.outputs.remote }}
+        run: |
+          set -euo pipefail
+          test "${CHANGED}" = "true"
+          test "${DRY_RUN}" = "true"
+          test "$(jq -r '.[0]' <<<"${UPDATED}")" = "joomengine/pkg-demo@main:component_updates.xml"
+          test "$(git --git-dir="${REMOTE}" rev-list --count main)" = "1"
+
+      - name: Inject the hashes
+        id: run
+        uses: ./
+        with:
+          config: ${{ steps.prepare.outputs.config }}
+          git-url: localhost
+          commit-message: 'chore: add sha512 hashes (CI test)'
+
+      - name: Verify the hashes were pushed
+        env:
+          CHANGED: ${{ steps.run.outputs.changed }}
+          DRY_RUN: ${{ steps.run.outputs.dry-run }}
+          UPDATED_COUNT: ${{ steps.run.outputs.updated-count }}
+          FAILED_COUNT: ${{ steps.run.outputs.failed-count }}
+          REMOTE: ${{ steps.prepare.outputs.remote }}
+          EXPECTED_SHA: ${{ steps.prepare.outputs.expected-sha }}
+        run: |
+          set -euo pipefail
+          test "${CHANGED}" = "true"
+          test "${DRY_RUN}" = "false"
+          test "${UPDATED_COUNT}" = "1"
+          test "${FAILED_COUNT}" = "0"
+          test "$(git --git-dir="${REMOTE}" rev-list --count main)" = "2"
+          test "$(git --git-dir="${REMOTE}" log -1 --format=%s main)" = "chore: add sha512 hashes (CI test)"
+          git --git-dir="${REMOTE}" show main:component_updates.xml | grep -q "<sha512>${EXPECTED_SHA}</sha512>"
+
+      - name: Second run is a no-op
+        id: rerun
+        uses: ./
+        with:
+          config: ${{ steps.prepare.outputs.config }}
+          git-url: localhost
+
+      - name: Verify nothing changed on the second run
+        env:
+          CHANGED: ${{ steps.rerun.outputs.changed }}
+          UNCHANGED_COUNT: ${{ steps.rerun.outputs.unchanged-count }}
+          REMOTE: ${{ steps.prepare.outputs.remote }}
+        run: |
+          set -euo pipefail
+          test "${CHANGED}" = "false"
+          test "${UNCHANGED_COUNT}" = "1"
+          test "$(git --git-dir="${REMOTE}" rev-list --count main)" = "2"
+
+      - name: A missing branch fails the action
+        id: failing
+        continue-on-error: true
+        uses: ./
+        with:
+          config-json: '{"update_servers":[{"owner":"joomengine","repo":"pkg-demo","branch":"does-not-exist","path":"component_updates.xml"}]}'
+          git-url: localhost
+
+      - name: Verify the failure was reported
+        env:
+          OUTCOME: ${{ steps.failing.outcome }}
+        run: |
+          set -euo pipefail
+          test "${OUTCOME}" = "failure"

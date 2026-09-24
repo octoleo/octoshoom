@@ -1,0 +1,184 @@
+name: 'OctoShoom'
+description: 'Inject SHA-512 hashes into Joomla update server XML files and push them back to their Git repositories.'
+author: 'Llewellyn van der Merwe'
+
+branding:
+  icon: 'hash'
+  color: 'purple'
+
+inputs:
+  config:
+    description: 'Path to the JSON configuration file that lists the update servers (relative to the workspace, or absolute). Either this or "config-json" is required.'
+    required: false
+    default: ''
+  config-json:
+    description: 'Inline JSON configuration with the "update_servers" array. Used when "config" is empty.'
+    required: false
+    default: ''
+  git-url:
+    description: 'SSH host of the Git server that holds the update server repositories (github.com, gitlab.com, git.vdm.dev, ...). Must match the "ssh-host" configured by octoleo/git-user. Defaults to github.com.'
+    required: false
+    default: ''
+  git-user:
+    description: 'Git author name for the commits. Leave empty to use the identity configured by octoleo/git-user.'
+    required: false
+    default: ''
+  git-email:
+    description: 'Git author email for the commits. Leave empty to use the identity configured by octoleo/git-user.'
+    required: false
+    default: ''
+  gpg-sign:
+    description: 'Sign the commits with GPG ("true" or "false"). Leave empty to inherit the global git configuration set by octoleo/git-user.'
+    required: false
+    default: ''
+  signing-key:
+    description: 'GPG key ID used to sign the commits. Leave empty to inherit the global git configuration set by octoleo/git-user.'
+    required: false
+    default: ''
+  commit-message:
+    description: 'Commit message for the hash updates.'
+    required: false
+    default: 'chore: add sha512 hashes via OctoShoom'
+  env-file:
+    description: 'Optional .env file to load (GIT_URL, GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_GPG_SIGN, GIT_SIGNING_KEY). Explicit inputs take precedence over its values.'
+    required: false
+    default: ''
+  dry-run:
+    description: 'Calculate the hashes and print the diff without committing or pushing ("true" or "false").'
+    required: false
+    default: 'false'
+  quiet:
+    description: 'Silence the informational output ("true" or "false").'
+    required: false
+    default: 'false'
+  install-dependencies:
+    description: 'Install missing system dependencies (xmlstarlet, jq, curl, git) with apt-get ("true" or "false").'
+    required: false
+    default: 'true'
+
+outputs:
+  changed:
+    description: '"true" when at least one update server XML file received new hashes.'
+    value: ${{ steps.octoshoom.outputs.changed }}
+  dry-run:
+    description: '"true" when the action ran in dry-run mode.'
+    value: ${{ steps.octoshoom.outputs.dry-run }}
+  updated:
+    description: 'JSON array of "owner/repo@branch:path" targets that were pushed (or would be pushed in dry-run mode).'
+    value: ${{ steps.octoshoom.outputs.updated }}
+  updated-count:
+    description: 'Number of updated targets.'
+    value: ${{ steps.octoshoom.outputs.updated-count }}
+  unchanged:
+    description: 'JSON array of "owner/repo@branch:path" targets that already carried the correct hashes.'
+    value: ${{ steps.octoshoom.outputs.unchanged }}
+  unchanged-count:
+    description: 'Number of unchanged targets.'
+    value: ${{ steps.octoshoom.outputs.unchanged-count }}
+  failed:
+    description: 'JSON array of "owner/repo@branch:path (reason)" entries for every failure.'
+    value: ${{ steps.octoshoom.outputs.failed }}
+  failed-count:
+    description: 'Number of failed targets.'
+    value: ${{ steps.octoshoom.outputs.failed-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install dependencies
+      if: ${{ inputs.install-dependencies == 'true' }}
+      shell: bash
+      run: |
+        missing=()
+        for cmd in git curl jq xmlstarlet sha512sum md5sum awk unexpand; do
+          command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
+        done
+
+        if ((${#missing[@]} == 0)); then
+          echo "All OctoShoom dependencies are installed."
+          exit 0
+        fi
+
+        echo "Installing missing dependencies: ${missing[*]}"
+
+        if ! command -v apt-get >/dev/null 2>&1; then
+          echo "::error::Missing ${missing[*]} and apt-get is not available. Install them before running OctoShoom, or set install-dependencies to 'false'."
+          exit 1
+        fi
+
+        declare -A packages=()
+        for cmd in "${missing[@]}"; do
+          case "${cmd}" in
+            git) packages[git]=1 ;;
+            curl) packages[curl]=1 ;;
+            jq) packages[jq]=1 ;;
+            xmlstarlet) packages[xmlstarlet]=1 ;;
+            awk) packages[gawk]=1 ;;
+            sha512sum|md5sum|unexpand) packages[coreutils]=1 ;;
+          esac
+        done
+
+        sudo_cmd=""
+        if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+          sudo_cmd="sudo"
+        fi
+
+        export DEBIAN_FRONTEND=noninteractive
+        ${sudo_cmd} apt-get update -qq || echo "::warning::apt-get update reported errors, trying to install anyway."
+        ${sudo_cmd} apt-get install -y -qq --no-install-recommends "${!packages[@]}"
+
+    - name: Run OctoShoom
+      id: octoshoom
+      shell: bash
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_CONFIG_JSON: ${{ inputs.config-json }}
+        INPUT_GIT_URL: ${{ inputs.git-url }}
+        INPUT_GIT_USER: ${{ inputs.git-user }}
+        INPUT_GIT_EMAIL: ${{ inputs.git-email }}
+        INPUT_GPG_SIGN: ${{ inputs.gpg-sign }}
+        INPUT_SIGNING_KEY: ${{ inputs.signing-key }}
+        INPUT_COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        INPUT_ENV_FILE: ${{ inputs.env-file }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_QUIET: ${{ inputs.quiet }}
+      run: |
+        chmod +x "${GITHUB_ACTION_PATH}/src/octoshoom"
+
+        # Resolve the configuration: a file path, or inline JSON written to a temporary file.
+        config_file="${INPUT_CONFIG}"
+        if [[ -z "${config_file}" ]]; then
+          if [[ -z "${INPUT_CONFIG_JSON}" ]]; then
+            echo "::error::Either the 'config' or the 'config-json' input must be set."
+            exit 1
+          fi
+          config_file="${RUNNER_TEMP:-/tmp}/octoshoom-config.json"
+          printf '%s\n' "${INPUT_CONFIG_JSON}" > "${config_file}"
+        elif [[ ! -f "${config_file}" ]]; then
+          echo "::error::Config file not found: ${config_file}"
+          exit 1
+        fi
+
+        # The Git host defaults to github.com unless the workflow environment,
+        # the env file or the git-url input says otherwise (input wins).
+        export GIT_URL="${GIT_URL:-github.com}"
+
+        # Git identity overrides are only exported when given, so the identity
+        # configured by octoleo/git-user (or any other global git config) is kept otherwise.
+        if [[ -n "${INPUT_GIT_USER}" ]]; then export GIT_AUTHOR_NAME="${INPUT_GIT_USER}"; fi
+        if [[ -n "${INPUT_GIT_EMAIL}" ]]; then export GIT_AUTHOR_EMAIL="${INPUT_GIT_EMAIL}"; fi
+        if [[ -n "${INPUT_GPG_SIGN}" ]]; then export GIT_GPG_SIGN="${INPUT_GPG_SIGN}"; fi
+        if [[ -n "${INPUT_SIGNING_KEY}" ]]; then export GIT_SIGNING_KEY="${INPUT_SIGNING_KEY}"; fi
+
+        # Results go to $GITHUB_OUTPUT (action outputs) and $GITHUB_STEP_SUMMARY (job summary).
+        export OCTOSHOOM_OUTPUT_FILE="${GITHUB_OUTPUT:-}"
+        export OCTOSHOOM_SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-}"
+
+        args=(--config="${config_file}")
+        if [[ -n "${INPUT_GIT_URL}" ]]; then args+=(--git-url="${INPUT_GIT_URL}"); fi
+        if [[ -n "${INPUT_ENV_FILE}" ]]; then args+=(--env="${INPUT_ENV_FILE}"); fi
+        if [[ -n "${INPUT_COMMIT_MESSAGE}" ]]; then args+=(--message="${INPUT_COMMIT_MESSAGE}"); fi
+        if [[ "${INPUT_DRY_RUN}" == "true" ]]; then args+=(--dry-run); fi
+        if [[ "${INPUT_QUIET}" == "true" ]]; then args+=(--quiet); fi
+
+        "${GITHUB_ACTION_PATH}/src/octoshoom" "${args[@]}"

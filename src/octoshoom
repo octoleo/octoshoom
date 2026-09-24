@@ -1,88 +1,316 @@
 #!/bin/bash
 #
 # OctoShoom — Joomla Update Server SHA512 Hash Injector
-# v1.0.1 | Adds <sha512> tags to Joomla update XML files, commits & pushes.
+# v1.1.0 | Adds <sha512> tags to Joomla update XML files, commits & pushes.
+#
+# Settings precedence: command line options > --env file > process environment.
 #
 
 # Program Metadata
 PROGRAM_NAME="OctoShoom"
 PROGRAM_CODE="octoshoom"
-PROGRAM_VERSION="1.0.1"
-PROGRAM_V="1.0"
+PROGRAM_VERSION="1.1.0"
+PROGRAM_V="1.1"
 PROGRAM_URL="https://git.vdm.dev/octoleo/${PROGRAM_CODE}"
 
-# PREP WORK
-command -v git >/dev/null 2>&1 || {
-	echo >&2 "[error] We require git for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
-	exit 1
-}
-command -v curl >/dev/null 2>&1 || {
-	echo >&2 "[error] We require curl for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
-	exit 1
-}
-command -v sha512sum >/dev/null 2>&1 || {
-	echo >&2 "[error] We require sha512sum for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
-	exit 1
-}
-command -v awk >/dev/null 2>&1 || {
-	echo >&2 "[error] We require awk for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
-	exit 1
-}
-command -v xmlstarlet >/dev/null 2>&1 || {
-	echo >&2 "[error] We require xmlstarlet for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
-	exit 1
-}
+# Default commit message (override with --message or OCTOSHOOM_COMMIT_MESSAGE)
+DEFAULT_COMMIT_MESSAGE="chore: add sha512 hashes via ${PROGRAM_NAME}"
+
+# Required commands
+REQUIRED_COMMANDS=(git curl jq xmlstarlet sha512sum md5sum awk unexpand mktemp)
+
+# QUIET MODE (may be updated once the env file and command line are applied)
+QUIET="${QUIET:-0}"
+
+# COMMAND LINE VALUES (applied after the env file is loaded)
+CLI_QUIET=""
+CLI_DRY_RUN=""
+CLI_CONF_FILE=""
+CLI_ENV_FILE=""
+CLI_COMMIT_MESSAGE=""
+CLI_OUTPUT_FILE=""
+CLI_GIT_URL=""
+
+# EFFECTIVE SETTINGS (resolved in resolveSettings)
+DRY_RUN=0
+CONF_FILE=""
+COMMIT_MESSAGE=""
+OUTPUT_FILE=""
+SUMMARY_FILE=""
+ENV_FILE_LOADED=""
 
 # GLOBAL CACHE for processed URLs
 declare -A URL_HASH_CACHE
 
+# RESULT TRACKING
+declare -a UPDATED=()   # targets that were pushed (or would be pushed in dry-run mode)
+declare -a UNCHANGED=() # targets that already carried the correct hashes
+declare -a FAILED=()    # "target (reason)" for every failure
+declare -a TMP_DIRS=()  # temporary clone directories (removed on exit)
+
+# Directory we were started from (relative paths are resolved against it)
+START_DIR="$(pwd)"
+
 # MAIN FUNCTION ˘Ô≈ôﺣ
 function main() {
-	[ -f "$OCTOSHOOM_CONF_FILE" ] && getProjectEnvironment || {
-		echo >&2 "[error] Missing config file $OCTOSHOOM_CONF_FILE. Aborting."
-		exit 1
-	}
+	parseArguments "$@"
+	loadEnvFile
+	resolveSettings
+	checkDependencies
 
-	processUpdateServers || {
-		echo >&2 "[error] One or more repositories failed to update. Aborting."
-		exit 1
-	}
+	[ -n "$ENV_FILE_LOADED" ] && _echo "[info] Loaded environment file: ${ENV_FILE_LOADED}"
 
-	_echo "[Success] All repositories updated with SHA512 hashes!"
+	loadConfig || exit 1
+
+	if [ -z "${GIT_URL:-}" ]; then
+		_error "GIT_URL is not set. Provide the SSH host (e.g. github.com) with --git-url, in the env file, or as an environment variable."
+		exit 1
+	fi
+
+	isTrue "$DRY_RUN" && _echo "[info] Dry-run mode: hashes are calculated but nothing is committed or pushed."
+
+	processUpdateServers
+
+	cd "$START_DIR" || true
+
+	writeOutputs
+	writeSummaryFile
+	printSummary
 
 	# Clear global cache (clean state)
 	unset URL_HASH_CACHE
+
+	if ((${#FAILED[@]} > 0)); then
+		_error "${#FAILED[@]} target(s) failed. Aborting."
+		exit 1
+	fi
+
+	_echo "[Success] All update servers processed with SHA512 hashes!"
+	exit 0
 }
 
-# QUIET MODE
-QUIET="${QUIET:-0}"
-_echo() { (("$QUIET" == 0)) && echo "$1"; }
+# OUTPUT HELPERS
+_echo() { isTrue "$QUIET" || echo "$1"; }
+_echo_err() { isTrue "$QUIET" || echo >&2 "$1"; }
+_warn() { echo >&2 "[warning] $1"; }
+_error() { echo >&2 "[error] $1"; }
 
-# LOAD ENVIRONMENT
-function getProjectEnvironment() {
-	VDM_CONFIG_DATA=$(cat "$OCTOSHOOM_CONF_FILE")
-	if [[ "${VDM_CONFIG_DATA}" =~ '"update_servers"' ]]; then
-		_echo "[info] Loading configuration for $PROGRAM_NAME..."
-		export VDM_CONFIG_DATA
-		return 0
+# TRUE/FALSE HELPER (1, true, yes, on are true; anything else is false)
+function isTrue() {
+	case "${1,,}" in
+	1 | true | yes | on) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# JSON ARRAY HELPER (arguments become a compact JSON array of strings)
+function toJsonArray() {
+	if (($# == 0)); then
+		printf '[]\n'
 	else
-		return 17
+		printf '%s\n' "$@" | jq -R . | jq -sc .
 	fi
+}
+
+# CLEANUP (always remove the temporary clone directories)
+# shellcheck disable=SC2317  # invoked through the EXIT trap
+function cleanup() {
+	local dir
+	cd "$START_DIR" 2>/dev/null || true
+	for dir in "${TMP_DIRS[@]}"; do
+		[ -n "$dir" ] && [ -d "$dir" ] && rm -rf "$dir"
+	done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+function removeTmpDir() {
+	local dir="$1" kept=() d
+	cd "$START_DIR" 2>/dev/null || true
+	[ -n "$dir" ] && [ -d "$dir" ] && rm -rf "$dir"
+	for d in "${TMP_DIRS[@]}"; do
+		[ "$d" != "$dir" ] && kept+=("$d")
+	done
+	TMP_DIRS=("${kept[@]}")
+}
+
+# RECORD A FAILURE (printed immediately and listed in the summary)
+function recordFailure() {
+	# @param $1 target (owner/repo[@branch[:path]])
+	# @param $2 reason
+	FAILED+=("$1 ($2)")
+	_error "$1: $2"
+}
+
+# ARGUMENT PARSING
+function parseArguments() {
+	while (($# > 0)); do
+		case "$1" in
+		-h | --help)
+			show_help
+			exit 0
+			;;
+		-V | --version)
+			echo "${PROGRAM_NAME} v${PROGRAM_VERSION}"
+			exit 0
+			;;
+		-q | --quiet) CLI_QUIET=1 ;;
+		-d | --dry-run) CLI_DRY_RUN=1 ;;
+		-c=* | --config=*) CLI_CONF_FILE="${1#*=}" ;;
+		-c | --config)
+			requireOptionValue "$1" "${2:-}"
+			CLI_CONF_FILE="$2"
+			shift
+			;;
+		-e=* | --env=*) CLI_ENV_FILE="${1#*=}" ;;
+		-e | --env)
+			requireOptionValue "$1" "${2:-}"
+			CLI_ENV_FILE="$2"
+			shift
+			;;
+		-m=* | --message=*) CLI_COMMIT_MESSAGE="${1#*=}" ;;
+		-m | --message)
+			requireOptionValue "$1" "${2:-}"
+			CLI_COMMIT_MESSAGE="$2"
+			shift
+			;;
+		-u=* | --git-url=*) CLI_GIT_URL="${1#*=}" ;;
+		-u | --git-url)
+			requireOptionValue "$1" "${2:-}"
+			CLI_GIT_URL="$2"
+			shift
+			;;
+		-o=* | --output=*) CLI_OUTPUT_FILE="${1#*=}" ;;
+		-o | --output)
+			requireOptionValue "$1" "${2:-}"
+			CLI_OUTPUT_FILE="$2"
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			_error "Unknown option: $1"
+			echo >&2 "Use --help to see the available options."
+			exit 1
+			;;
+		*)
+			_error "Unexpected argument: $1"
+			echo >&2 "Use --help to see the available options."
+			exit 1
+			;;
+		esac
+		shift
+	done
+}
+
+function requireOptionValue() {
+	# @param $1 option name
+	# @param $2 option value
+	if [ -z "$2" ]; then
+		_error "Option $1 requires a value."
+		exit 1
+	fi
+}
+
+# LOAD ENV FILE
+# Order of lookup: --env option > OCTOSHOOM_ENV_FILE > $HOME/.config/octoshoom/.env
+function loadEnvFile() {
+	local env_file="${CLI_ENV_FILE:-${OCTOSHOOM_ENV_FILE:-}}"
+
+	if [ -n "$env_file" ]; then
+		if [ ! -f "$env_file" ]; then
+			_error "Environment file not found: ${env_file}"
+			exit 1
+		fi
+	elif [ -f "${HOME:-/nonexistent}/.config/${PROGRAM_CODE}/.env" ]; then
+		env_file="${HOME}/.config/${PROGRAM_CODE}/.env"
+	else
+		return 0
+	fi
+
+	# shellcheck disable=SC1090
+	if ! source "$env_file"; then
+		_error "Could not load environment file: ${env_file}"
+		exit 1
+	fi
+	ENV_FILE_LOADED="$env_file"
+}
+
+# RESOLVE SETTINGS (command line > env file > process environment > defaults)
+function resolveSettings() {
+	QUIET="${CLI_QUIET:-${QUIET:-0}}"
+	DRY_RUN="${CLI_DRY_RUN:-${OCTOSHOOM_DRY_RUN:-0}}"
+	CONF_FILE="${CLI_CONF_FILE:-${OCTOSHOOM_CONF_FILE:-}}"
+	COMMIT_MESSAGE="${CLI_COMMIT_MESSAGE:-${OCTOSHOOM_COMMIT_MESSAGE:-${DEFAULT_COMMIT_MESSAGE}}}"
+	OUTPUT_FILE="${CLI_OUTPUT_FILE:-${OCTOSHOOM_OUTPUT_FILE:-}}"
+	SUMMARY_FILE="${OCTOSHOOM_SUMMARY_FILE:-${GITHUB_STEP_SUMMARY:-}}"
+	GIT_URL="${CLI_GIT_URL:-${GIT_URL:-}}"
+}
+
+# DEPENDENCY CHECK
+function checkDependencies() {
+	local cmd missing=()
+	for cmd in "${REQUIRED_COMMANDS[@]}"; do
+		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+	done
+	if ((${#missing[@]} > 0)); then
+		_error "We require ${missing[*]} for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+		exit 1
+	fi
+}
+
+# LOAD CONFIGURATION
+function loadConfig() {
+	if [ -z "$CONF_FILE" ]; then
+		_error "No config file given. Use --config=/path/to/config.json"
+		return 1
+	fi
+	if [ ! -f "$CONF_FILE" ]; then
+		_error "Config file not found: ${CONF_FILE}"
+		return 1
+	fi
+
+	VDM_CONFIG_DATA=$(cat "$CONF_FILE")
+
+	if ! echo "${VDM_CONFIG_DATA}" | jq -e '(.update_servers | type == "array") and (.update_servers | length > 0)' >/dev/null 2>&1; then
+		_error "Config file ${CONF_FILE} must contain a non-empty \"update_servers\" array."
+		return 1
+	fi
+
+	local invalid
+	invalid=$(echo "${VDM_CONFIG_DATA}" | jq -r '
+		.update_servers
+		| to_entries[]
+		| select(((.value.owner // "") == "") or ((.value.repo // "") == "") or ((.value.path // "") == ""))
+		| .key')
+	if [ -n "$invalid" ]; then
+		_error "Config file ${CONF_FILE}: every update server needs \"owner\", \"repo\" and \"path\" (check index: $(echo "$invalid" | tr '\n' ' '))."
+		return 1
+	fi
+
+	_echo "[info] Loading configuration for $PROGRAM_NAME..."
+	export VDM_CONFIG_DATA
+	return 0
 }
 
 # GIT USER CONFIG
 function setUserDetails() {
-	# Configure Git commit identity and signing.
-	[ -n "${GIT_AUTHOR_NAME+x}" ] && git config user.name "${GIT_AUTHOR_NAME}" && _echo "[info] Git author name set: ${GIT_AUTHOR_NAME}"
-	[ -n "${GIT_AUTHOR_EMAIL+x}" ] && git config user.email "${GIT_AUTHOR_EMAIL}" && _echo "[info] Git author email set: ${GIT_AUTHOR_EMAIL}"
-	[ -n "${GIT_SIGNING_KEY+x}" ] && git config user.signingkey "${GIT_SIGNING_KEY}" && _echo "[info] Git signing key set."
-	[ -n "${GIT_GPG_SIGN+x}" ] && git config commit.gpgsign "${GIT_GPG_SIGN}" && _echo "[info] Git commit signing: ${GIT_GPG_SIGN}"
+	# Configure Git commit identity and signing (only when explicitly given;
+	# otherwise the global git configuration, e.g. from octoleo/git-user, is used).
+	[ -n "${GIT_AUTHOR_NAME:-}" ] && git config user.name "${GIT_AUTHOR_NAME}" && _echo "[info] Git author name set: ${GIT_AUTHOR_NAME}"
+	[ -n "${GIT_AUTHOR_EMAIL:-}" ] && git config user.email "${GIT_AUTHOR_EMAIL}" && _echo "[info] Git author email set: ${GIT_AUTHOR_EMAIL}"
+	[ -n "${GIT_SIGNING_KEY:-}" ] && git config user.signingkey "${GIT_SIGNING_KEY}" && _echo "[info] Git signing key set."
+	[ -n "${GIT_GPG_SIGN:-}" ] && git config commit.gpgsign "${GIT_GPG_SIGN}" && _echo "[info] Git commit signing: ${GIT_GPG_SIGN}"
+	return 0
 }
 
 # PROCESS UPDATE SERVERS
 function processUpdateServers() {
 	# Group update servers by owner/repo
-	local grouped_json
+	local grouped_json repos entry owner repo branches
 	grouped_json=$(echo "${VDM_CONFIG_DATA}" | jq -c '
 	  .update_servers
 	  | group_by({owner, repo})
@@ -92,16 +320,14 @@ function processUpdateServers() {
 	      branches: map({branch: (.branch // "master"), path: .path})
 	    })')
 
-	local repo_count
-	repo_count=$(echo "$grouped_json" | jq 'length')
+	mapfile -t repos < <(echo "$grouped_json" | jq -c '.[]')
 
-	for ((r=0; r<repo_count; r++)); do
-		local owner repo branches
-		owner=$(echo "$grouped_json" | jq -r ".[$r].owner")
-		repo=$(echo "$grouped_json" | jq -r ".[$r].repo")
-		branches=$(echo "$grouped_json" | jq -c ".[$r].branches")
+	for entry in "${repos[@]}"; do
+		owner=$(echo "$entry" | jq -r '.owner')
+		repo=$(echo "$entry" | jq -r '.repo')
+		branches=$(echo "$entry" | jq -c '.branches')
 
-		processSingleRepository "$owner" "$repo" "$branches" || return 11
+		processSingleRepository "$owner" "$repo" "$branches"
 	done
 	return 0
 }
@@ -114,59 +340,105 @@ function processSingleRepository() {
 	local owner="$1"
 	local repo="$2"
 	local branches_json="$3"
-	local tmp_repo_dir
-	tmp_repo_dir=$(mktemp -d)
-	trap 'rm -rf "$tmp_repo_dir"' EXIT
+	local target="${owner}/${repo}"
+	local tmp_repo_dir repo_dir entries entry branch path
 
-	_echo "[info] Cloning ${owner}/${repo} (bare, shallow)..."
-	git clone --no-checkout --filter=blob:none --depth=1 -q "git@${GIT_URL}:${owner}/${repo}.git" "$tmp_repo_dir/$repo" || return 12
-	cd "$tmp_repo_dir/$repo" || return 13
+	if ! tmp_repo_dir=$(mktemp -d); then
+		recordFailure "$target" "could not create a temporary directory"
+		return 1
+	fi
+	TMP_DIRS+=("$tmp_repo_dir")
+	repo_dir="${tmp_repo_dir}/${repo}"
 
-	local branch_count
-	branch_count=$(echo "$branches_json" | jq 'length')
+	_echo "[info] Cloning ${target} (bare, shallow)..."
+	if ! git clone --no-checkout --filter=blob:none --depth=1 -q "git@${GIT_URL}:${owner}/${repo}.git" "$repo_dir"; then
+		recordFailure "$target" "clone failed for git@${GIT_URL}:${owner}/${repo}.git"
+		removeTmpDir "$tmp_repo_dir"
+		return 1
+	fi
 
-	for ((b=0; b<branch_count; b++)); do
-		local branch path
-		branch=$(echo "$branches_json" | jq -r ".[$b].branch // \"master\"")
-		path=$(echo "$branches_json" | jq -r ".[$b].path")
+	mapfile -t entries < <(echo "$branches_json" | jq -c '.[]')
 
-		_echo "[info] Fetching branch: $branch"
-		if ! git fetch --depth=1 origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1; then
-			echo >&2 "[error] Branch $branch not found on remote ${owner}/${repo}, skipping..."
-			continue
-		fi
+	for entry in "${entries[@]}"; do
+		branch=$(echo "$entry" | jq -r '.branch // "master"')
+		path=$(echo "$entry" | jq -r '.path')
 
-		_echo "[info] Resetting working tree to branch: $branch"
-		git checkout --detach >/dev/null 2>&1
-		git reset --hard "origin/$branch" >/dev/null 2>&1 || {
-			echo >&2 "[error] Could not reset to branch $branch, skipping..."
-			continue
-		}
-		git switch -C "$branch" >/dev/null 2>&1 || true
-
-		local xml_file="$tmp_repo_dir/$repo/$path"
-		if [ ! -f "$xml_file" ]; then
-			echo >&2 "[error] XML file $path not found in branch $branch"
-			continue
-		fi
-
-		updateXmlWithHashes "$xml_file"
-		formatXmlTabs "$xml_file"
-		commitAndPush "$tmp_repo_dir/$repo" "$branch" "$path"
+		processBranch "$repo_dir" "$owner" "$repo" "$branch" "$path"
 	done
 
-	rm -rf "$tmp_repo_dir"
+	removeTmpDir "$tmp_repo_dir"
+	return 0
+}
+
+# PROCESS ONE BRANCH/XML FILE OF A REPOSITORY
+function processBranch() {
+	# @param $1 local repository path
+	# @param $2 owner
+	# @param $3 repo
+	# @param $4 branch
+	# @param $5 path to XML file in repo
+	local repo_dir="$1"
+	local owner="$2"
+	local repo="$3"
+	local branch="$4"
+	local path="$5"
+	local target="${owner}/${repo}@${branch}:${path}"
+	local xml_file="${repo_dir}/${path}"
+	local head
+
+	if ! cd "$repo_dir"; then
+		recordFailure "$target" "could not enter the cloned repository"
+		return 1
+	fi
+
+	_echo "[info] Fetching branch: $branch"
+	if ! git fetch --depth=1 origin "refs/heads/${branch}:refs/remotes/origin/${branch}" >/dev/null 2>&1; then
+		recordFailure "$target" "branch '${branch}' not found on remote ${owner}/${repo}"
+		return 1
+	fi
+
+	_echo "[info] Resetting working tree to branch: $branch"
+	# Detach HEAD (without touching the working tree) so the reset never moves another branch.
+	if head=$(git rev-parse --verify -q HEAD); then
+		git update-ref --no-deref HEAD "$head" >/dev/null 2>&1 || true
+	fi
+	if ! git reset --hard "origin/${branch}" >/dev/null 2>&1; then
+		recordFailure "$target" "could not reset the working tree to origin/${branch}"
+		return 1
+	fi
+	git switch -C "$branch" >/dev/null 2>&1 || true
+
+	if [ ! -f "$xml_file" ]; then
+		recordFailure "$target" "XML file '${path}' not found in branch '${branch}'"
+		return 1
+	fi
+
+	if ! xmlstarlet val -q "$xml_file" >/dev/null 2>&1; then
+		recordFailure "$target" "XML file '${path}' is not well-formed"
+		return 1
+	fi
+
+	updateXmlWithHashes "$xml_file" "$target"
+
+	if ! formatXmlTabs "$xml_file"; then
+		recordFailure "$target" "could not format the XML file"
+		return 1
+	fi
+
+	commitAndPush "$repo_dir" "$branch" "$path" "$target"
 }
 
 # ADD TAB FORMAT TO XML FILE
 function formatXmlTabs() {
-	local xml="$1" tmp="${xml}.tmp"
+	local xml="$1"
+	local tmp="${xml}.tmp"
 	# Pretty-print with 2 spaces, then convert *leading* spaces to tabs
 	# (unexpand without -a only converts leading blanks)
-	if xmlstarlet fo --indent-spaces 2 "$xml" | unexpand -t 2 > "$tmp"; then
+	if xmlstarlet fo --indent-spaces 2 "$xml" | unexpand -t 2 >"$tmp"; then
 		mv "$tmp" "$xml"
 	else
-		rm -f "$tmp"; return 1
+		rm -f "$tmp"
+		return 1
 	fi
 }
 
@@ -181,18 +453,18 @@ function getOrComputeHash() {
 	# Check if we already cached this key
 	if [[ -v "URL_HASH_CACHE[$key]" ]]; then
 		# Value exists in cache
-		echo "[info] Already computed, reuse" >&2
+		_echo_err "[info] Already computed, reuse"
 		echo "${URL_HASH_CACHE[$key]}"
 		return 0
 	fi
 
 	# Otherwise download and compute
-	local tmp_file sha
+	local tmp_file sha_output sha
 	tmp_file=$(mktemp)
 
-	echo "[info] Downloading package: $(basename "$url")" >&2
-	if ! curl -sL "$url" -o "$tmp_file"; then
-		echo "[error] Failed to download $url" >&2
+	_echo_err "[info] Downloading package: $(basename "$url")"
+	if ! curl -sSL --fail --retry 2 --connect-timeout 30 "$url" -o "$tmp_file"; then
+		_error "Failed to download $url"
 		rm -f "$tmp_file"
 		return 1
 	fi
@@ -210,23 +482,35 @@ function getOrComputeHash() {
 
 # Function to generate a stable key from a URL
 function generateKey() {
-    local url="$1"
-    # Output only the MD5 hash, no trailing newline or filename
-    printf '%s' "$url" | md5sum | awk '{print $1}'
+	local url="$1"
+	# Output only the MD5 hash, no trailing newline or filename
+	printf '%s' "$url" | md5sum | awk '{print $1}'
 }
 
 # UPDATE XML WITH HASHES
 function updateXmlWithHashes() {
 	# Downloads each <downloadurl> file, calculates SHA512, updates <sha512>.
 	# @param $1 Path to XML file to modify
+	# @param $2 Target label (owner/repo@branch:path) used for failure reporting
 	local xml="$1"
-	local urls sha update_xpath
+	local target="$2"
+	local urls dl sha update_xpath
+	local failures=0
 
-	# Collect all download URLs from the XML
-	mapfile -t urls < <(xmlstarlet sel -t -v "//downloadurl" -n "$xml")
+	# Collect all unique download URLs from the XML (text mode: entities are decoded)
+	mapfile -t urls < <(xmlstarlet sel -T -t -m "//downloadurl" -v . -n "$xml" 2>/dev/null | awk 'NF && !seen[$0]++')
+
+	if ((${#urls[@]} == 0)); then
+		_warn "No <downloadurl> found in ${target}."
+		return 0
+	fi
 
 	for dl in "${urls[@]}"; do
-		sha=$(getOrComputeHash "$dl") || continue
+		if ! sha=$(getOrComputeHash "$dl"); then
+			recordFailure "$target" "download failed: ${dl}"
+			((failures++))
+			continue
+		fi
 		_echo "[info] SHA512: $sha"
 
 		# XPath to <update> node containing this downloadurl
@@ -238,6 +522,8 @@ function updateXmlWithHashes() {
 		# Add new sha512 under that <update>
 		xmlstarlet ed -L -s "$update_xpath" -t elem -n "sha512" -v "$sha" "$xml"
 	done
+
+	((failures == 0))
 }
 
 # COMMIT & PUSH CHANGES
@@ -246,23 +532,118 @@ function commitAndPush() {
 	# @param $1 Local repository path
 	# @param $2 Branch name
 	# @param $3 Path to XML file in repo
+	# @param $4 Target label (owner/repo@branch:path)
 	local repo_path="$1"
 	local branch="$2"
 	local file_path="$3"
+	local target="$4"
+	local output
 
-	cd "$repo_path" || return 21
+	if ! cd "$repo_path"; then
+		recordFailure "$target" "could not enter the cloned repository"
+		return 21
+	fi
 	setUserDetails
 
-	if git diff --quiet "$file_path"; then
+	if git diff --quiet -- "$file_path"; then
 		_echo "[info] No changes detected in $file_path."
+		UNCHANGED+=("$target")
 		return 0
 	fi
 
-	git add "$file_path"
-	git commit -m "chore: add sha512 hashes via $PROGRAM_NAME" >/dev/null 2>&1 || return 22
+	if isTrue "$DRY_RUN"; then
+		_echo "[dry-run] Changes detected in $file_path (not committed, not pushed):"
+		isTrue "$QUIET" || git --no-pager diff -- "$file_path"
+		UPDATED+=("$target")
+		return 0
+	fi
+
+	git add -- "$file_path"
+	if ! output=$(git commit -m "$COMMIT_MESSAGE" 2>&1); then
+		recordFailure "$target" "commit failed"
+		echo >&2 "$output"
+		return 22
+	fi
+
 	_echo "[info] Pushing changes to ${branch}..."
-	git push origin "$branch" >/dev/null 2>&1 || return 23
-	_echo "[success] Pushed updates for ${repo_path##*/}"
+	if ! output=$(git push origin "$branch" 2>&1); then
+		recordFailure "$target" "push failed"
+		echo >&2 "$output"
+		return 23
+	fi
+
+	_echo "[success] Pushed updates for ${target}"
+	UPDATED+=("$target")
+	return 0
+}
+
+# WRITE OUTPUTS (key=value lines, e.g. to $GITHUB_OUTPUT)
+function writeOutputs() {
+	[ -n "$OUTPUT_FILE" ] || return 0
+
+	local changed=false dry_run=false
+	((${#UPDATED[@]} > 0)) && changed=true
+	isTrue "$DRY_RUN" && dry_run=true
+
+	if ! {
+		echo "changed=${changed}"
+		echo "dry-run=${dry_run}"
+		echo "updated=$(toJsonArray "${UPDATED[@]}")"
+		echo "updated-count=${#UPDATED[@]}"
+		echo "unchanged=$(toJsonArray "${UNCHANGED[@]}")"
+		echo "unchanged-count=${#UNCHANGED[@]}"
+		echo "failed=$(toJsonArray "${FAILED[@]}")"
+		echo "failed-count=${#FAILED[@]}"
+	} >>"$OUTPUT_FILE"; then
+		_warn "Could not write outputs to ${OUTPUT_FILE}"
+	fi
+}
+
+# WRITE MARKDOWN SUMMARY (e.g. to $GITHUB_STEP_SUMMARY)
+function writeSummaryFile() {
+	[ -n "$SUMMARY_FILE" ] || return 0
+
+	local title="${PROGRAM_NAME} v${PROGRAM_VERSION}" item
+	isTrue "$DRY_RUN" && title="${title} (dry run)"
+
+	if ! {
+		echo "## ${title}"
+		echo
+		echo "| Result | Count |"
+		echo "| --- | --- |"
+		echo "| Updated | ${#UPDATED[@]} |"
+		echo "| Unchanged | ${#UNCHANGED[@]} |"
+		echo "| Failed | ${#FAILED[@]} |"
+		if ((${#UPDATED[@]} > 0)); then
+			echo
+			echo "### Updated"
+			for item in "${UPDATED[@]}"; do echo "- \`${item}\`"; done
+		fi
+		if ((${#UNCHANGED[@]} > 0)); then
+			echo
+			echo "### Unchanged"
+			for item in "${UNCHANGED[@]}"; do echo "- \`${item}\`"; done
+		fi
+		if ((${#FAILED[@]} > 0)); then
+			echo
+			echo "### Failed"
+			for item in "${FAILED[@]}"; do echo "- \`${item}\`"; done
+		fi
+		echo
+	} >>"$SUMMARY_FILE"; then
+		_warn "Could not write summary to ${SUMMARY_FILE}"
+	fi
+}
+
+# PRINT SUMMARY
+function printSummary() {
+	local item
+	_echo "======================================================"
+	_echo "[summary] Updated: ${#UPDATED[@]} | Unchanged: ${#UNCHANGED[@]} | Failed: ${#FAILED[@]}"
+	for item in "${UPDATED[@]}"; do _echo "  updated:   ${item}"; done
+	for item in "${UNCHANGED[@]}"; do _echo "  unchanged: ${item}"; done
+	for item in "${FAILED[@]}"; do _echo "  failed:    ${item}"; done
+	_echo "======================================================"
 }
 
 # SHOW HELP ʕ•ᴥ•ʔ
@@ -272,18 +653,45 @@ Usage: ${PROGRAM_CODE} [OPTIONS]
 
 Options:
 ======================================================
-  --config=<file>       Path to JSON configuration file
-  -e | --env=<file>     Path to .env file with GIT variables
-  -q | --quiet          Silence all output
-  -h | --help           Display this help message
+  -c | --config=<file>    Path to JSON configuration file
+  -e | --env=<file>       Path to .env file with GIT variables
+  -u | --git-url=<host>   SSH host of the Git server (e.g. github.com)
+  -m | --message=<text>   Commit message (default: "${DEFAULT_COMMIT_MESSAGE}")
+  -o | --output=<file>    Append key=value results to this file (e.g. \$GITHUB_OUTPUT)
+  -d | --dry-run          Calculate hashes and show the diff, but do not commit or push
+  -q | --quiet            Silence all output
+  -V | --version          Display the version
+  -h | --help             Display this help message
 
 Environment Variables:
 ======================================================
-  GIT_AUTHOR_NAME       Git author name
-  GIT_AUTHOR_EMAIL      Git author email
-  GIT_GPG_SIGN          true|false
-  GIT_SIGNING_KEY       GPG key ID
-  GIT_URL               SSH domain (e.g. git.vdm.dev)
+  GIT_URL                   SSH domain (e.g. github.com, git.vdm.dev)
+  GIT_AUTHOR_NAME           Git author name (optional, overrides the global git config)
+  GIT_AUTHOR_EMAIL          Git author email (optional, overrides the global git config)
+  GIT_GPG_SIGN              true|false (optional, overrides the global git config)
+  GIT_SIGNING_KEY           GPG key ID (optional, overrides the global git config)
+  OCTOSHOOM_CONF_FILE       Path to JSON configuration file
+  OCTOSHOOM_ENV_FILE        Path to .env file (default: \$HOME/.config/${PROGRAM_CODE}/.env)
+  OCTOSHOOM_COMMIT_MESSAGE  Commit message
+  OCTOSHOOM_DRY_RUN         true|false
+  OCTOSHOOM_OUTPUT_FILE     File that receives the key=value results
+  OCTOSHOOM_SUMMARY_FILE    File that receives a Markdown summary (default: \$GITHUB_STEP_SUMMARY)
+  QUIET                     1|0
+
+Precedence: command line options > env file > environment variables.
+
+Results (written to the output file):
+======================================================
+  changed=true|false        At least one XML file received new hashes
+  dry-run=true|false        Whether this was a dry run
+  updated=[...]             JSON array of "owner/repo@branch:path" targets updated
+  updated-count=<n>
+  unchanged=[...]           JSON array of targets that were already up to date
+  unchanged-count=<n>
+  failed=[...]              JSON array of "target (reason)" entries
+  failed-count=<n>
+
+Exit code: 0 when every target succeeded, 1 otherwise.
 
 Config Example (JSON):
 ======================================================
@@ -304,34 +712,10 @@ Config Example (JSON):
 }
 ======================================================
               ${PROGRAM_NAME} v${PROGRAM_VERSION}
+              ${PROGRAM_URL}
 ======================================================
 EOF
 }
 
-# DEFAULTS
-START_DATE=$(TZ=":ZULU" date +"%m/%d/%Y @ %R (UTC)")
-CREATION_DATE=$(TZ=":ZULU" date +"%B %Y")
-CREATION_YEAR=$(TZ=":ZULU" date +"%Y")
-
-# ARGUMENT PARSING
-while :; do
-	case $1 in
-	-h|--help) show_help; exit 0 ;;
-	-q|--quiet) QUIET=1 ;;
-	-e=*|--env=*) ENV_FILE=${1#*=}; source "$ENV_FILE" ;;
-	--config=*) OCTOSHOOM_CONF_FILE=${1#*=} ;;
-	--) shift; break ;;
-	*) break ;;
-	esac
-	shift
-done
-
-[ -f "${OCTOSHOOM_CONF_FILE}" ] || {
-	echo >&2 "[error] No config file found. Use --config=/path/to/config.json"
-	exit 1
-}
-
 # RUN MAIN ┬┴┬┴┤(･_├┬┴┬┴
-main
-exit 0
-
+main "$@"
